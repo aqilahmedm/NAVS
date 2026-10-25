@@ -8,3 +8,11 @@ node_modules/
 !.env.example
 .venv/
 venv/
+
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.pyc
+.secret_key

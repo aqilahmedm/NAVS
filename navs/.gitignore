@@ -1,0 +1,6 @@
+.secret_key
+__pycache__/
+certs/
+node_modules/
+.env
+*.pyc
