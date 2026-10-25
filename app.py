@@ -5,7 +5,7 @@ Optional MongoDB: set MONGO_URI; otherwise an in-memory store is used (demo data
 import base64, csv, functools, hashlib, hmac, io, ipaddress, json, os, random, re, secrets, struct, threading, time
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
-from flask import Flask, Response, g, jsonify, request, session, send_from_directory
+from flask import Flask, Response, g, jsonify, request, session, send_from_directory, has_request_context
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -18,7 +18,9 @@ def _secret():
     p = os.path.join(BASE, ".secret_key")
     if os.environ.get("SECRET_KEY"): return os.environ["SECRET_KEY"]
     if not os.path.exists(p):
-        with open(p, "w") as f: f.write(secrets.token_hex(32))
+        try:
+            with open(p, "w") as f: f.write(secrets.token_hex(32))
+        except OSError: raise RuntimeError("Set the SECRET_KEY environment variable (this host's disk is read-only).")
         try: os.chmod(p, 0o600)
         except OSError: pass
     return open(p).read().strip()
@@ -61,6 +63,85 @@ def open_store():
         except Exception as e: print("MongoDB unavailable, using memory:", type(e).__name__, str(e)[:200].replace(uri, "<MONGO_URI>"))
     return Mem()
 DB = open_store()
+
+# ---- shared auth state. On serverless hosts (Vercel) every request may run in a different process, so sessions, one-time codes,
+# lockouts, rate limits and CAPTCHA answers must live in MongoDB, not in process memory. Without MongoDB this is a plain dict.
+import copy, datetime
+_PMAPS = []
+class PMap:
+    """dict-like. Records are read once per request and written back (changed fields only) when the request ends."""
+    def __init__(s, name, ttl):
+        s.name, s.ttl, s.mem, s.tl = name, ttl, {}, threading.local(); _PMAPS.append(s)
+    def shared(s): return bool(getattr(DB, "persistent", False)) and hasattr(DB, "d")
+    def _col(s): return DB.d["_state"]
+    def _id(s, k): return s.name + ":" + ("|".join(map(str, k)) if isinstance(k, tuple) else str(k))
+    def _exp(s): return datetime.datetime.utcnow() + datetime.timedelta(seconds=s.ttl)
+    def _cache(s):
+        if not has_request_context(): return None
+        c = getattr(s.tl, "c", None)
+        if c is None: c = s.tl.c = {}
+        return c
+    def get(s, k, d=None):
+        if not s.shared(): return s.mem.get(k, d)
+        c, i = s._cache(), s._id(k)
+        if c is not None and i in c: return c[i][1]
+        doc = s._col().find_one({"_id": i})
+        if not doc: return d
+        if c is not None: c[i] = (k, doc["v"], copy.deepcopy(doc["v"]))
+        return doc["v"]
+    def __getitem__(s, k):
+        v = s.get(k, KeyError)
+        if v is KeyError: raise KeyError(k)
+        return v
+    def __contains__(s, k): return s.get(k, KeyError) is not KeyError
+    def __setitem__(s, k, v):
+        if not s.shared(): s.mem[k] = v; return
+        i, c = s._id(k), s._cache()
+        s._col().update_one({"_id": i}, {"$set": {"n": s.name, "v": v, "exp": s._exp()}}, upsert=True)
+        if c is not None: c[i] = (k, v, copy.deepcopy(v))
+    def pop(s, k, d=None):
+        if not s.shared(): return s.mem.pop(k, d)
+        i, c = s._id(k), s._cache()
+        if c is not None: c.pop(i, None)
+        doc = s._col().find_one_and_delete({"_id": i})
+        return doc["v"] if doc else d
+    def items(s):
+        if not s.shared(): return list(s.mem.items())
+        return [(d["_id"][len(s.name) + 1:], d["v"]) for d in s._col().find({"n": s.name}).limit(5000)]
+    def setdefault(s, k, d=None):
+        if not s.shared(): return s.mem.setdefault(k, d)
+        v = s.get(k, KeyError)
+        if v is KeyError: s[k] = d; v = s.get(k, d)
+        return v
+    def values(s): return [v for _, v in s.items()]
+    def keys(s): return [k for k, _ in s.items()]
+    def clear(s):
+        s.mem.clear()
+        if s.shared(): s._col().delete_many({"n": s.name})
+    def __len__(s): return len(s.mem) if not s.shared() else s._col().count_documents({"n": s.name})
+    def flush(s):
+        c = getattr(s.tl, "c", None)
+        if not c or not s.shared(): return
+        for i, (k, v, snap) in list(c.items()):
+            if v == snap: continue
+            try:
+                if isinstance(v, dict) and isinstance(snap, dict):
+                    up = {"$set": {**{"v." + f: x for f, x in v.items() if f not in snap or snap[f] != x}, "exp": s._exp()}}
+                    gone = {"v." + f: "" for f in snap if f not in v}
+                    if gone: up["$unset"] = gone
+                    s._col().update_one({"_id": i}, up)          # no upsert: a record signed out in parallel must stay gone
+                else: s._col().update_one({"_id": i}, {"$set": {"n": s.name, "v": v, "exp": s._exp()}}, upsert=True)
+            except Exception as e: print("state write failed:", type(e).__name__)
+@app.after_request
+def _pmap_flush(resp):
+    for m in _PMAPS: m.flush()
+    return resp
+@app.teardown_request
+def _pmap_clear(exc):
+    for m in _PMAPS: m.tl.c = {}
+if getattr(DB, "persistent", False) and hasattr(DB, "d"):
+    try: DB.d["_state"].create_index("exp", expireAfterSeconds=0); DB.d["_state"].create_index("n")
+    except Exception as e: print("state index:", type(e).__name__)
 
 # ------------------------------------------------------------ fictional seed data (60 colleges, 600 students)
 FNM = "Aarav Vivaan Ishaan Rahul Arjun Vikram Rohit Kabir Aditya Karthik Sanjay Dev Nikhil Varun".split()
@@ -185,7 +266,7 @@ FACTORS = {"student": ["otp"], "employer": ["otp"], "institution": ["otp"], "aic
 POLICY = {"student": dict(idle=1800, abs=8 * 3600), "employer": dict(idle=1800, abs=8 * 3600),
           "institution": dict(idle=900, abs=6 * 3600), "aicte": dict(idle=600, abs=4 * 3600)}              # seconds
 STEPUP_TTL, STEPUP_METHOD = int(os.environ.get("APAAR_STEPUP_TTL", 600)), {"institution": "otp", "aicte": "totp"}   # seconds a confirmation stays fresh
-OTPS, PRE, SES, FAILS, LOCKED, RL, TOTP_LAST, PWH, VERIFIED_LOG = {}, {}, {}, {}, {}, {}, {}, {}, []
+OTPS, PRE, SES, FAILS, LOCKED, RL, TOTP_LAST, PWH, VERIFIED_LOG = PMap("OTPS", 400), PMap("PRE", 1800), PMap("SES", 30000), PMap("FAILS", 1000), PMap("LOCKED", 1000), PMap("RL", 700), PMap("TOTP_LAST", 400), {}, []
 AUDIT_LOCK = threading.Lock()
 ALLOW = [ipaddress.ip_network(c.strip(), strict=False) for c in os.environ.get("AICTE_ALLOW_IPS", "").split(",") if c.strip()]
 
@@ -338,7 +419,7 @@ GLYPHS = {"A": "01110 10001 10001 11111 10001 10001 10001", "C": "01110 10001 10
   "5": "11111 10000 11110 00001 00001 10001 01110", "6": "00110 01000 10000 11110 10001 10001 01110", "7": "11111 00001 00010 00100 01000 01000 01000", "8": "01110 10001 10001 01110 10001 10001 01110",
   "9": "01110 10001 10001 01111 00001 00010 01100"}
 ALPHA = "".join(GLYPHS)                       # leaves out look-alikes such as 0/O, 1/I, B/8, S/5, Z/2
-CAPS, NUMW = {}, ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+CAPS, NUMW = PMap("CAPS", 300), ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
 def captcha_svg(text):
     r, W, H, cell = random.SystemRandom(), 236, 86, 6.9
     dark, light = ["#12315F", "#7A1F2B", "#14532D", "#4C1D95", "#7C2D12", "#1F2937"], ["#b9a77a", "#94a3b8", "#c08457", "#8aa5c8", "#a3b18a"]
@@ -437,7 +518,7 @@ def auth_totp():
     return jsonify(error="Incorrect or already-used code."), 400
 
 # ---- forgot password: one-time code to the registered contact (AICTE also needs the authenticator code). Same reply whether or not the account exists.
-RST = {}
+RST = PMap("RST", 1000)
 @app.post("/api/auth/forgot")
 def auth_forgot():
     b = request.get_json(silent=True) or {}; role = str(b.get("role")); un = str(b.get("username", "")).strip().lower()[:60]
