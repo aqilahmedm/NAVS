@@ -1,0 +1,21 @@
+# Render Blueprint: New + > Blueprint > pick this repo. Then paste your MongoDB URI into MONGO_URI (it is never stored in git).
+services:
+  - type: web
+    name: navs
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # ONE worker on purpose: sign-in sessions, rate limits and lockouts live in process memory.
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 60 --bind 0.0.0.0:$PORT --access-logfile -
+    healthCheckPath: /healthz
+    envVars:
+      - key: APAAR_PROXY          # Render terminates HTTPS: trust its proxy headers and mark cookies Secure
+        value: "1"
+      - key: SECRET_KEY           # generated once by Render; keep it stable (it signs sessions and the audit chain)
+        generateValue: true
+      - key: MONGO_URI            # paste in the Render dashboard
+        sync: false
+      - key: MONGO_DB
+        value: navs
+      - key: DEMO_SHOW_OTP        # demo mode shows one-time codes on screen (no SMS/email gateway)
+        value: "1"
